@@ -1,0 +1,297 @@
+%  ESCENARIO 3:
+%  "Q-in-Q + QoS: Prioridad Voice(EF) + AF para Video + BE para Datos
+%   CON Policing (token bucket) y Shaping (suavizado de ráfagas)"
+%
+%  - Red Metro Ethernet triple-play con:
+%      * S-VLAN (operador) y C-VLANs por servicio (Q-in-Q)
+%      * PCP para priorización conceptual (0..7)
+%  - Se aplican policers (token buckets) por servicio para limitar ráfagas
+%    por encima del perfil contratado.
+%  - Prioridad estricta en salida: Voice (EF) tiene cola prioritaria.
+%    Video recibe "Assured" (porcentaje del resto) y Datos son Best Effort.
+%  - Objetivo: mostrar cómo policing + prioridad mantienen calidad de voz
+%    y controlan vídeo, a costa de datos; y permitir explicar token bucket,
+%    shaping, y trade-offs.
+
+clear; clc; close all;
+
+Tsim = 10;      % segundos de simulación
+dt   = 1e-3;    % paso 1 ms
+N    = round(Tsim / dt);
+t    = (0:N-1) * dt;
+
+% Capacidad del enlace Metro [bits/s]
+C_bps = 20e6;   % 20 Mbps (enlace congestionado)
+C_bytes_slot = C_bps * dt / 8;   % bytes por slot dt
+
+% Buffer total compartido
+buffer_total_bytes = 2e6;   % 2 MB buffer
+
+%% ------------------ Q-in-Q y mapeo de VLAN/PCP ------------------
+S_VLAN_ID = 1000;
+C_VLAN_VOICE = 100;   PCP_VOICE = 5;   % alta prioridad conceptual (EF)
+C_VLAN_VIDEO = 200;   PCP_VIDEO = 3;   % prioridad media (AF)
+C_VLAN_DATA  = 300;   PCP_DATA  = 0;   % BE
+
+NUM_SERV = 3;
+VOICE = 1; VIDEO = 2; DATA = 3;
+
+servicios(NUM_SERV) = struct();
+servicios(VOICE).nombre = 'Voz (VoIP)'; servicios(VOICE).rate_bps = 2e6;   servicios(VOICE).pkt_size = 200; servicios(VOICE).var_rel = 0.05;
+servicios(VIDEO).nombre = 'Vídeo (IPTV)'; servicios(VIDEO).rate_bps = 20e6; servicios(VIDEO).pkt_size = 1400; servicios(VIDEO).var_rel = 0.20;
+servicios(DATA).nombre  = 'Datos (Internet)'; servicios(DATA).rate_bps = 10e6; servicios(DATA).pkt_size = 1000; servicios(DATA).var_rel = 0.50;
+
+%% ------------------ POLICING (Token Bucket) por servicio --------
+% Definimos un policer por servicio con token bucket:
+% - CIR = committed information rate [bps] -> tasa "permitida" sostenida
+% - CBS = committed burst size [bytes] -> burst aceptable sin drop
+% - Excess: bytes por encima de CBS se marcan como "excess" y se pueden dropear
+
+% Elegimos CIR (pueden reflejar contratos):
+servicios(VOICE).CIR_bps = 2e6;   % voz contratada 2 Mbps (se ajusta a lo real)
+servicios(VIDEO).CIR_bps = 15e6;  % capamos vídeo a 15 Mbps (ejemplo de policing)
+servicios(DATA).CIR_bps  = 5e6;   % datos limitados a 5 Mbps (perfil)
+% CBS (tolerancia a ráfagas) en bytes:
+servicios(VOICE).CBS_bytes = 50e3;   % 50 KB burst para voz (pequeño)
+servicios(VIDEO).CBS_bytes = 500e3;  % 500 KB para vídeo (más burst)
+servicios(DATA).CBS_bytes  = 200e3;  % 200 KB para datos
+
+% Inicialización de tokens (empezamos llenos)
+tokens = zeros(1, NUM_SERV);
+for s = 1:NUM_SERV
+    tokens(s) = servicios(s).CBS_bytes; % tokens almacenados en bytes
+end
+
+% Tasa de llenado de tokens por slot (bytes/slot)
+tokens_refill_per_slot = zeros(1, NUM_SERV);
+for s = 1:NUM_SERV
+    tokens_refill_per_slot(s) = servicios(s).CIR_bps * dt / 8;
+end
+
+% "Policed accepted" y "policed dropped" contadores
+policed_accept_bytes = zeros(1, NUM_SERV);
+policed_drop_bytes   = zeros(1, NUM_SERV);
+
+%% ------------------ PRIORIDADES Y GARANTÍAS ------------------
+% Estrategia de salida (prioridad estricta con garantías):
+% - Voz (EF): garantizada hasta voice_guarantee_pct del enlace.
+% - Video (AF): recibe % del resto o hasta su cola/policer.
+% - Datos (BE): resto residual.
+
+voice_guarantee_pct = 0.30;  % 30% del enlace para voz (ejemplo)
+% Video AF: definiremos una fracción del residual (ej. 60% del resto)
+video_share_of_rest = 0.60;
+
+%% ------------------ ESTRUCTURAS DE ESTADO Y RESULTADOS -------------
+queue_bytes = zeros(NUM_SERV, N);   % cola por servicio (bytes)
+cola_actual = zeros(1, NUM_SERV);
+buffer_ocupado = 0;
+
+tx_bytes = zeros(1, NUM_SERV);
+drop_bytes = zeros(1, NUM_SERV);
+tx_slot = zeros(NUM_SERV, N);
+drop_slot = zeros(NUM_SERV, N);
+
+% Para medir retardos/jitter aproximado (simple, basado en cola promedio)
+avg_queue_time_ms = zeros(1, NUM_SERV); % estimación de retardo medio (ms)
+
+%% ====================== BUCLE DE SIMULACIÓN ===================
+fprintf('Simulando ESCENARIO 3: Q-in-Q + Policing + Prioridad (EF/AF/BE)...\n');
+
+for k = 1:N
+    % 1) GENERACIÓN DE TRÁFICO (llegadas)
+    llegadas = zeros(1, NUM_SERV);
+    for s = 1:NUM_SERV
+        R = servicios(s).rate_bps;
+        var_rel = servicios(s).var_rel;
+        factor = 1 + var_rel * randn;
+        if factor < 0, factor = 0; end
+        bytes_generados = (R * factor) * dt / 8;
+        bytes_generados = round(bytes_generados);
+        llegadas(s) = bytes_generados;
+    end
+    
+    % 2) APLICAR POLICER (Token Bucket) - decide qué entra a la cola (shaping)
+    %    - Si tokens >= llegada: todo entra (aceptado).
+    %    - Si tokens < llegada: aceptamos tokens (hasta tokens) y el resto se
+    %      considera "excess" y se descarta (policer strict drop).
+    %    - Luego actualizamos tokens = min(CBS, tokens + refill)
+    for s = 1:NUM_SERV
+        % Refill tokens primero (emulamos que el bucket se rellena cada slot)
+        tokens(s) = min(servicios(s).CBS_bytes, tokens(s) + tokens_refill_per_slot(s));
+        
+        if llegadas(s) <= tokens(s)
+            % Acepta todo
+            aceptado = llegadas(s);
+            tokens(s) = tokens(s) - aceptado;
+            
+            % Encolamos (si hay espacio en buffer)
+            espacio_libre = max(0, buffer_total_bytes - buffer_ocupado);
+            if aceptado <= espacio_libre
+                cola_actual(s) = cola_actual(s) + aceptado;
+                buffer_ocupado = buffer_ocupado + aceptado;
+            else
+                % Aceptado por policer pero buffer lleno -> drop por buffer
+                aceptado_parcial = espacio_libre;
+                if aceptado_parcial > 0
+                    cola_actual(s) = cola_actual(s) + aceptado_parcial;
+                    buffer_ocupado = buffer_ocupado + aceptado_parcial;
+                end
+                dropped_by_buffer = aceptado - aceptado_parcial;
+                drop_bytes(s) = drop_bytes(s) + dropped_by_buffer;
+                drop_slot(s, k) = drop_slot(s, k) + dropped_by_buffer;
+            end
+            policed_accept_bytes(s) = policed_accept_bytes(s) + aceptado;
+        else
+            % Tokens insuficientes -> aceptamos lo que tokens permitan y
+            % el resto lo descartamos por policer.
+            aceptado = tokens(s);
+            descartado_policer = llegadas(s) - tokens(s);  % drop por policer
+            tokens(s) = 0;
+            
+            % Encolamos lo aceptado (si hay espacio)
+            espacio_libre = max(0, buffer_total_bytes - buffer_ocupado);
+            if aceptado <= espacio_libre
+                cola_actual(s) = cola_actual(s) + aceptado;
+                buffer_ocupado = buffer_ocupado + aceptado;
+            else
+                aceptado_parcial = espacio_libre;
+                if aceptado_parcial > 0
+                    cola_actual(s) = cola_actual(s) + aceptado_parcial;
+                    buffer_ocupado = buffer_ocupado + aceptado_parcial;
+                end
+                dropped_by_buffer = aceptado - aceptado_parcial;
+                drop_bytes(s) = drop_bytes(s) + dropped_by_buffer;
+                drop_slot(s, k) = drop_slot(s, k) + dropped_by_buffer;
+            end
+            % contabilizamos drops por policer
+            policed_accept_bytes(s) = policed_accept_bytes(s) + aceptado;
+            policed_drop_bytes(s) = policed_drop_bytes(s) + descartado_policer;
+            drop_bytes(s) = drop_bytes(s) + descartado_policer;
+            drop_slot(s, k) = drop_slot(s, k) + descartado_policer;
+        end
+    end
+    
+    % 3) SALIDA DEL ENLACE CON PRIORIDADES (Voice EF -> Video AF -> Data BE)
+    capacidad_restante = C_bytes_slot;
+    
+    % 3.1 SERVIR VOZ (garantía voice_guarantee_pct del enlace)
+    voice_guarantee_bytes = floor(voice_guarantee_pct * C_bytes_slot);
+    serve_voice = min(cola_actual(VOICE), voice_guarantee_bytes);
+    if serve_voice > 0
+        cola_actual(VOICE) = cola_actual(VOICE) - serve_voice;
+        buffer_ocupado = buffer_ocupado - serve_voice;
+        tx_bytes(VOICE) = tx_bytes(VOICE) + serve_voice;
+        tx_slot(VOICE, k) = tx_slot(VOICE, k) + serve_voice;
+        capacidad_restante = capacidad_restante - serve_voice;
+    end
+    
+    % Si la voz todavía tiene cola y capacidad restante, deja que se drene (prioridad estricta).
+    if cola_actual(VOICE) > 0 && capacidad_restante > 0
+        extra_voice = min(cola_actual(VOICE), capacidad_restante);
+        cola_actual(VOICE) = cola_actual(VOICE) - extra_voice;
+        buffer_ocupado = buffer_ocupado - extra_voice;
+        tx_bytes(VOICE) = tx_bytes(VOICE) + extra_voice;
+        tx_slot(VOICE, k) = tx_slot(VOICE, k) + extra_voice;
+        capacidad_restante = capacidad_restante - extra_voice;
+    end
+    
+    % 3.2 SERVIR VIDEO (AF) - recibe parte del resto (p.ej. 60% del resto)
+    if capacidad_restante > 0
+        video_alloc = floor(video_share_of_rest * capacidad_restante);
+        serve_video = min(cola_actual(VIDEO), video_alloc);
+        serve_video = min(serve_video, capacidad_restante); % sanity
+        if serve_video > 0
+            cola_actual(VIDEO) = cola_actual(VIDEO) - serve_video;
+            buffer_ocupado = buffer_ocupado - serve_video;
+            tx_bytes(VIDEO) = tx_bytes(VIDEO) + serve_video;
+            tx_slot(VIDEO, k) = tx_slot(VIDEO, k) + serve_video;
+            capacidad_restante = capacidad_restante - serve_video;
+        end
+    end
+    
+    % 3.3 SERVIR DATOS (BE) - recibe lo que quede
+    if capacidad_restante > 0
+        serve_data = min(cola_actual(DATA), capacidad_restante);
+        if serve_data > 0
+            cola_actual(DATA) = cola_actual(DATA) - serve_data;
+            buffer_ocupado = buffer_ocupado - serve_data;
+            tx_bytes(DATA) = tx_bytes(DATA) + serve_data;
+            tx_slot(DATA, k) = tx_slot(DATA, k) + serve_data;
+            capacidad_restante = capacidad_restante - serve_data;
+        end
+    end
+    
+    % 4) GUARDAR ESTADO
+    queue_bytes(:, k) = cola_actual(:);
+    
+    % 5) estimación retardo medio simple: queue_bytes / out_rate -> ms
+    for s = 1:NUM_SERV
+        % Estimamos retardo medio aproximado: bytes en cola / (tasa transmitida por segundo)
+        ref_rate_bps = max(1, servicios(s).CIR_bps); % bps
+        avg_queue_time_ms(s) = (cola_actual(s) * 8 / ref_rate_bps) * 1000; % ms
+    end
+end
+
+%% ====================== METRICAS GLOBALES =======================
+throughput_bps = (tx_bytes * 8) / Tsim; % bps
+prob_desc = zeros(1, NUM_SERV);
+for s = 1:NUM_SERV
+    bytes_generated_approx = servicios(s).rate_bps * Tsim / 8;
+    if bytes_generated_approx > 0
+        prob_desc(s) = drop_bytes(s) / bytes_generated_approx;
+    else
+        prob_desc(s) = 0;
+    end
+end
+
+% Mostrar resumen
+fprintf('\n================== RESULTADOS ESCENARIO 3 (Policing+Prioridad) ==================\n');
+fprintf('Config: Q-in-Q (S-VLAN=%d), Policing token-bucket por C-VLAN, Voice garantizada %.0f%% del enlace\n', S_VLAN_ID, voice_guarantee_pct*100);
+for s = 1:NUM_SERV
+    fprintf('Servicio: %-15s | Thpt = %6.2f Mbps | Descarte aprox = %5.2f %% | Policer drop = %8.0f bytes\n', ...
+        servicios(s).nombre, throughput_bps(s)/1e6, prob_desc(s)*100, policed_drop_bytes(s));
+end
+
+%% ====================== GRAFICAS ==============================
+col_voice = [0 0.447 0.741]; col_video = [0.8500 0.3250 0.0980]; col_data = [0.4660 0.6740 0.1880];
+
+% 1) Colas
+figure;
+subplot(3,1,1); plot(t, queue_bytes(VOICE,:), 'Color', col_voice, 'LineWidth',1.2); grid on; title('Cola Voz (EF)'); ylabel('Bytes');
+subplot(3,1,2); plot(t, queue_bytes(VIDEO,:), 'Color', col_video, 'LineWidth',1.2); grid on; title('Cola Vídeo (AF)'); ylabel('Bytes');
+subplot(3,1,3); plot(t, queue_bytes(DATA,:),  'Color', col_data,  'LineWidth',1.2); grid on; title('Cola Datos (BE)'); ylabel('Bytes'); xlabel('Tiempo [s]');
+
+% 2) Ocupación buffer
+colas_norm = (queue_bytes.' / buffer_total_bytes) * 100;
+figure; area(t, colas_norm); grid on; title('Ocupación relativa del buffer por servicio (Policing+Prioridad)'); xlabel('Tiempo [s]'); ylabel('Ocupación buffer [%]');
+legend({servicios(VOICE).nombre, servicios(VIDEO).nombre, servicios(DATA).nombre}, 'Location','northwest');
+
+% 3) Throughput instantáneo suavizado
+ventana_suav = 200; b = ones(ventana_suav,1)/ventana_suav;
+figure;
+for s = 1:NUM_SERV
+    subplot(3,1,s);
+    th_inst = tx_slot(s,:) * 8 / (dt * 1e6);
+    th_suav = filter(b,1,th_inst);
+    plot(t, th_suav, 'LineWidth', 1.2); grid on;
+    title(['Throughput instantáneo suavizado - ', servicios(s).nombre]);
+    ylabel('Mbps');
+    if s == NUM_SERV, xlabel('Tiempo [s]'); end
+end
+
+% 4) Barras de resumen: Thpt y descarts
+th_mbps = throughput_bps/1e6; desc_pct = prob_desc*100;
+figure;
+subplot(1,2,1); bar(th_mbps); set(gca,'XTickLabel',{servicios.nombre}); ylabel('Throughput medio [Mbps]'); title('Throughput medio por servicio'); grid on;
+subplot(1,2,2); bar([desc_pct; policed_drop_bytes/1e3]'); set(gca,'XTickLabel',{servicios.nombre}); ylabel('Descartes [%] / Policer drop [kB]'); title('Pérdidas y drops por policer'); legend('Desc %','Policer drop [kB]');
+
+%% ====================== INTERPRETACIÓN ==================
+fprintf('\nPuntos clave para la exposición (Escenario 3):\n');
+fprintf('- Se aplicó Q-in-Q: S-VLAN %d, C-VLANs: Voz=%d, Vídeo=%d, Datos=%d (permite aislar C-VLANs). \n', S_VLAN_ID, C_VLAN_VOICE, C_VLAN_VIDEO, C_VLAN_DATA);
+fprintf('- Policing mediante token-bucket: CIR y CBS limitan la entrada aceptada en cada servicio. Esto evita que un servicio "consuma" más de su perfil.\n');
+fprintf('- Voice (EF) tiene garantía de %.0f%% del enlace; por tanto tiene prioridad para salir y baja pérdida/jitter.\n', voice_guarantee_pct*100);
+fprintf('- Vídeo se capó a CIR=%g Mbps (policer), lo que reduce su dominio sobre el buffer en comparación con Escenario 1.\n', servicios(VIDEO).CIR_bps/1e6);
+fprintf('- Datos quedan relegados a BE y sufren la mayor parte de los descartes; muestran alta variabilidad.\n');
+fprintf('- Explicar token-bucket: tokens se reponen a CIR/slot hasta CBS; si llegada > tokens -> drop por policer.\n');
+fprintf('- Mostrar en las gráficas: colas (voz pequeña y estable), ocupación buffer (vídeo menor que en Escenario1), throughput y barras de descartes (policer drops visibles).\n\n');
